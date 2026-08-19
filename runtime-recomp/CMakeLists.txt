@@ -70,6 +70,11 @@ if(DKR_RUNTIME_BUILD_RT64)
     set(RT64_SDL_WINDOW_VULKAN TRUE CACHE BOOL "Allow SDL/Vulkan window integration" FORCE)
     add_compile_definitions(HLSL_CPU)
     add_subdirectory("${DKR_RT64_SOURCE}" "${CMAKE_BINARY_DIR}/rt64")
+    if(APPLE AND TARGET rt64)
+        target_include_directories(rt64 PRIVATE
+            "${DKR_RT64_SOURCE}/src/contrib/plume/contrib/metal-cpp")
+        target_compile_options(rt64 PRIVATE -include stdlib.h)
+    endif()
     if(MSVC AND TARGET rt64)
         # RT64 enables /MP internally. Ensure all compiler workers serialize
         # writes to the target PDB so clean RelWithDebInfo builds are reliable.
@@ -201,9 +206,18 @@ if(DKR_RUNTIME_BUILD_GENERATED)
         )
         target_link_libraries(DKRPortGame PRIVATE rt64)
         if(APPLE)
-            target_include_directories(DKRPortGame PRIVATE
-                "${DKR_RT64_SOURCE}/src/contrib/metal-cpp"
-            )
+            # metal-cpp is vendored by plume (RT64's render abstraction layer),
+            # not by RT64 itself. RT64 ships no Metal sources of its own since
+            # the plume migration, so src/contrib/metal-cpp does not exist.
+            set(DKR_METAL_CPP_DIR
+                "${DKR_RT64_SOURCE}/src/contrib/plume/contrib/metal-cpp")
+            if(NOT EXISTS "${DKR_METAL_CPP_DIR}/Metal/Metal.hpp")
+                message(FATAL_ERROR
+                    "metal-cpp was not found at ${DKR_METAL_CPP_DIR}. Fetch RT64 "
+                    "with its submodules so plume and its vendored metal-cpp are "
+                    "present.")
+            endif()
+            target_include_directories(DKRPortGame PRIVATE "${DKR_METAL_CPP_DIR}")
         endif()
         if(WIN32)
             target_include_directories(DKRPortGame PRIVATE

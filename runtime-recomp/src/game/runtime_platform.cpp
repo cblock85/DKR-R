@@ -9,8 +9,12 @@
 #include "runtime_ui.hpp"
 #include "imgui/imgui.h"
 #include <SDL.h>
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__APPLE__)
 #include <SDL_syswm.h>
+#endif
+#if defined(__APPLE__)
+#include <objc/message.h>
+#include <objc/runtime.h>
 #endif
 #endif
 
@@ -207,7 +211,13 @@ void dkr::runtime::platform::shutdown() {
 #if DKR_RUNTIME_HAS_RT64
 ultramodern::renderer::WindowHandle dkr::runtime::platform::create_window() {
     if (g_window == nullptr) {
+#if defined(__APPLE__)
+        // RT64 builds plume with Retina scaling disabled; a HiDPI SDL
+        // drawable would mismatch it and misplace both output and input.
+        Uint32 flags = SDL_WINDOW_RESIZABLE;
+#else
         Uint32 flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI;
+#endif
 #if defined(__linux__)
         flags |= SDL_WINDOW_VULKAN;
 #endif
@@ -232,6 +242,28 @@ ultramodern::renderer::WindowHandle dkr::runtime::platform::create_window() {
         return {};
     }
     return {.window = info.info.win.window, .thread_id = GetCurrentThreadId()};
+#elif defined(__APPLE__)
+    SDL_SysWMinfo info{};
+    SDL_VERSION(&info.version);
+    if (g_window == nullptr || SDL_GetWindowWMInfo(g_window, &info) != SDL_TRUE) {
+        std::fprintf(stderr, "[boot][window] native handle failed: %s\n", SDL_GetError());
+        return {};
+    }
+    void* ns_window = info.info.cocoa.window;
+    static SDL_MetalView s_metal_view = nullptr;
+    if (s_metal_view != nullptr) {
+        SDL_Metal_DestroyView(s_metal_view);
+        s_metal_view = nullptr;
+    }
+    s_metal_view = SDL_Metal_CreateView(g_window);
+    void* metal_layer =
+        s_metal_view != nullptr ? SDL_Metal_GetLayer(s_metal_view) : nullptr;
+    if (ns_window == nullptr || metal_layer == nullptr) {
+        std::fprintf(stderr, "[boot][window] Metal layer resolution failed: %s\n",
+                     SDL_GetError());
+        return {};
+    }
+    return {.window = ns_window, .view = metal_layer};
 #else
     return g_window;
 #endif
