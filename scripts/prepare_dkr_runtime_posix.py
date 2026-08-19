@@ -300,6 +300,21 @@ def main() -> int:
                  "macOS: xcode-select --install && brew install cmake ninja. "
                  "Linux: apt install build-essential cmake ninja-build.")
 
+    # The decomp's Makefiles use the != shell-assignment operator, which
+    # requires GNU Make >= 4.0. Apple ships GNU Make 3.81 (2006), on which
+    # != silently assigns to a junk variable and build directories are
+    # never created. Prefer Homebrew's gmake when the system make is old.
+    make_cmd = "make"
+    probe = subprocess.run(["make", "--version"], capture_output=True, text=True)
+    first_line = probe.stdout.splitlines()[0] if probe.stdout else ""
+    if "GNU Make 3." in first_line:
+        if shutil.which("gmake"):
+            make_cmd = "gmake"
+            ok(f"System make is outdated ({first_line.strip()}); using gmake.")
+        else:
+            fail("The system GNU Make is too old for the decomp Makefiles "
+                 "(>= 4.0 required). Install one with: brew install make")
+
     if platform.system() == "Darwin" and platform.machine() == "arm64":
         # The decomp's matching IDO compilers ship as x86_64 macOS binaries
         # and run under Rosetta 2 on Apple Silicon.
@@ -320,14 +335,20 @@ def main() -> int:
 
     step("Locating and normalising the user-owned ROM")
     canonical_rom = DKR_SOURCE / "baseroms" / "dkr.us.v77.z64"
+    # make setup renames staged baseroms to the splat scheme, so accept
+    # either name on reruns.
+    existing_rom = next(
+        (q for q in (canonical_rom,
+                     DKR_SOURCE / "baseroms" / "baserom.us.v77.z64")
+         if q.is_file()), None)
     if args.rom:
         rom_bytes = normalise_rom(args.rom.expanduser().resolve(), canonical_rom)
-    elif canonical_rom.is_file():
-        rom_bytes = canonical_rom.read_bytes()
+    elif existing_rom is not None:
+        rom_bytes = existing_rom.read_bytes()
         digest = hashlib.sha1(rom_bytes).hexdigest()
         if digest != EXPECTED_SHA1:
-            fail(f"The prepared ROM at {canonical_rom} does not match DKR US 1.0.")
-        ok(f"Using the previously prepared canonical ROM: {canonical_rom}")
+            fail(f"The prepared ROM at {existing_rom} does not match DKR US 1.0.")
+        ok(f"Using the previously prepared canonical ROM: {existing_rom}")
     else:
         fail("No ROM was provided. Rerun with --rom /path/to/your/dkr.us.z64 "
              "(your own legally obtained US 1.0 dump).")
@@ -343,17 +364,23 @@ def main() -> int:
             ["git", "-C", DKR_SOURCE, "submodule", "update", "--init", "--recursive"],
             log_path=log_path)
         venv_python = DKR_SOURCE / ".venv" / "bin" / "python3"
-        needs_setup = not venv_python.exists() or subprocess.run(
-            [venv_python, "-c", "import splat"], capture_output=True).returncode != 0
+        # A leftover .venv is not proof of completed setup: make setup also
+        # builds tools/dkr_assets_tool, whose absence the extract target
+        # masks with "|| echo FAIL".
+        assets_tool = DKR_SOURCE / "tools" / "dkr_assets_tool"
+        needs_setup = (not venv_python.exists()
+                       or not assets_tool.exists()
+                       or subprocess.run([venv_python, "-c", "import splat"],
+                                         capture_output=True).returncode != 0)
         if needs_setup:
             print("[INFO] The DKR Python/tool environment is incomplete; running make setup.")
-            run("make setup", ["make", "setup"], cwd=DKR_SOURCE, log_path=log_path)
+            run("make setup", [make_cmd, "setup"], cwd=DKR_SOURCE, log_path=log_path)
         if subprocess.run([venv_python, "-c", "import splat"],
                           capture_output=True).returncode != 0:
             fail("DKR make setup completed, but the splat module is still "
                  "unavailable in .venv. Remove extern/dkr-decomp/.venv and retry.")
-        run("make extract", ["make", "extract"], cwd=DKR_SOURCE, log_path=log_path)
-        run(f"make -j{jobs}", ["make", f"-j{jobs}"], cwd=DKR_SOURCE, log_path=log_path)
+        run("make extract", [make_cmd, "extract"], cwd=DKR_SOURCE, log_path=log_path)
+        run(f"make -j{jobs}", [make_cmd, f"-j{jobs}"], cwd=DKR_SOURCE, log_path=log_path)
 
     if not elf_path.is_file():
         fail(f"The DKR build did not produce the expected ELF: {elf_path}")
@@ -435,14 +462,28 @@ def main() -> int:
         step("Compiling generated DKR CPU code against N64ModernRuntime")
         probe_build = PROJECT_ROOT / "build" / "dkr-runtime-probe"
         renderer = "OFF" if args.no_renderer else "ON"
+        # Pin dependency discovery to Homebrew on macOS: cross-toolchains
+        # such as devkitPro export their own SDL2 (no Cocoa) that would
+        # otherwise shadow the host SDL2.
+        probe_env = None
+        if platform.system() == "Darwin" and shutil.which("brew"):
+            prefix = subprocess.run(["brew", "--prefix"], capture_output=True,
+                                    text=True).stdout.strip()
+            if prefix:
+                probe_env = dict(os.environ)
+                probe_env["CMAKE_PREFIX_PATH"] = prefix + (
+                    ":" + probe_env["CMAKE_PREFIX_PATH"]
+                    if probe_env.get("CMAKE_PREFIX_PATH") else "")
+                probe_env.setdefault("SDL2_DIR", f"{prefix}/lib/cmake/SDL2")
         run("Configure runtime probe",
             ["cmake", "-S", RUNTIME_ROOT, "-B", probe_build, "-G", "Ninja",
              "-DCMAKE_BUILD_TYPE=Release", f"-DDKRPORT_ROOT={PROJECT_ROOT}",
              "-DDKR_RUNTIME_BUILD_GENERATED=ON",
-             f"-DDKR_RUNTIME_BUILD_RT64={renderer}"], log_path=log_path)
+             f"-DDKR_RUNTIME_BUILD_RT64={renderer}"],
+            env=probe_env, log_path=log_path)
         run("Build runtime probe",
             ["cmake", "--build", probe_build, "--parallel", str(jobs)],
-            log_path=log_path)
+            env=probe_env, log_path=log_path)
         probe = find_executable(probe_build, "DKRRuntimeProbe")
         run("Run runtime probe", [probe])
         probe_built = True
